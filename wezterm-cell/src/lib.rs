@@ -870,6 +870,15 @@ impl UnicodeVersion {
                 return (*width).into();
             }
         }
+        // Spacing combining marks (General_Category=Mc) in the Indic
+        // blocks, such as the Devanagari vowel signs ा ि ी ो, occupy a
+        // column of their own according to libc wcwidth(3), VTE and the
+        // shells built upon them. Keeping them zero-width here makes the
+        // cursor position computed by the application drift away from
+        // where the terminal actually is whenever Hindi text is edited.
+        if (0x0900..0x0E00).contains(&(c as u32)) && is_indic_spacing_mark(c) {
+            return 1;
+        }
         self.width(WCWIDTH_TABLE.classify(c))
     }
 
@@ -980,7 +989,97 @@ pub fn grapheme_column_width(s: &str, version: Option<&UnicodeVersion>) -> usize
         width += version.wcwidth(c);
     }
 
+    // Indic conjuncts (consonant + virama + consonant ...) are a single
+    // grapheme but applications (and libc wcwidth) count each consonant as
+    // one column. Don't cap those at 2 cells, otherwise the cursor
+    // position drifts away from what the application believes.
+    if width > 2 && s.chars().any(is_indic_virama) {
+        return width;
+    }
+
     width.min(2)
+}
+
+/// General_Category=Mc ranges within U+0900..U+0DFF
+const INDIC_SPACING_MARKS: &[(u32, u32)] = &[
+    (0x0903, 0x0903),
+    (0x093B, 0x093B),
+    (0x093E, 0x0940),
+    (0x0949, 0x094C),
+    (0x094E, 0x094F),
+    (0x0982, 0x0983),
+    (0x09BE, 0x09C0),
+    (0x09C7, 0x09C8),
+    (0x09CB, 0x09CC),
+    (0x09D7, 0x09D7),
+    (0x0A03, 0x0A03),
+    (0x0A3E, 0x0A40),
+    (0x0A83, 0x0A83),
+    (0x0ABE, 0x0AC0),
+    (0x0AC9, 0x0AC9),
+    (0x0ACB, 0x0ACC),
+    (0x0B02, 0x0B03),
+    (0x0B3E, 0x0B3E),
+    (0x0B40, 0x0B40),
+    (0x0B47, 0x0B48),
+    (0x0B4B, 0x0B4C),
+    (0x0B57, 0x0B57),
+    (0x0BBE, 0x0BBF),
+    (0x0BC1, 0x0BC2),
+    (0x0BC6, 0x0BC8),
+    (0x0BCA, 0x0BCC),
+    (0x0BD7, 0x0BD7),
+    (0x0C01, 0x0C03),
+    (0x0C41, 0x0C44),
+    (0x0C82, 0x0C83),
+    (0x0CBE, 0x0CBE),
+    (0x0CC0, 0x0CC4),
+    (0x0CC7, 0x0CC8),
+    (0x0CCA, 0x0CCB),
+    (0x0CD5, 0x0CD6),
+    (0x0CF3, 0x0CF3),
+    (0x0D02, 0x0D03),
+    (0x0D3E, 0x0D40),
+    (0x0D46, 0x0D48),
+    (0x0D4A, 0x0D4C),
+    (0x0D57, 0x0D57),
+    (0x0D82, 0x0D83),
+    (0x0DCF, 0x0DD1),
+    (0x0DD8, 0x0DDF),
+    (0x0DF2, 0x0DF3),
+];
+
+fn is_indic_spacing_mark(c: char) -> bool {
+    let c = c as u32;
+    INDIC_SPACING_MARKS
+        .binary_search_by(|&(lo, hi)| {
+            if c < lo {
+                core::cmp::Ordering::Greater
+            } else if c > hi {
+                core::cmp::Ordering::Less
+            } else {
+                core::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// Returns true if `c` is a virama/halant that joins consonants into
+/// a conjunct in an Indic script.
+fn is_indic_virama(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x094D // Devanagari
+        | 0x09CD // Bengali
+        | 0x0A4D // Gurmukhi
+        | 0x0ACD // Gujarati
+        | 0x0B4D // Oriya
+        | 0x0BCD // Tamil
+        | 0x0C4D // Telugu
+        | 0x0CCD // Kannada
+        | 0x0D4D // Malayalam
+        | 0x0DCA // Sinhala
+    )
 }
 
 /// Models a change in the attributes of a cell in a stream of changes.
@@ -1004,6 +1103,20 @@ pub enum AttributeChange {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn indic_conjunct_widths() {
+        // क्ष : 2 consonants
+        assert_eq!(grapheme_column_width("क\u{94d}ष", None), 2);
+        // स्त्र : 3 consonants must not be capped at 2
+        assert_eq!(grapheme_column_width("स\u{94d}त\u{94d}र", None), 3);
+        // consonant + spacing vowel sign: 2 columns, like libc wcwidth
+        assert_eq!(grapheme_column_width("सा", None), 2);
+        // consonant + non-spacing vowel sign: 1 column
+        assert_eq!(grapheme_column_width("सु", None), 1);
+        // conjunct + vowel sign sums up like wcswidth does
+        assert_eq!(grapheme_column_width("स\u{94d}त\u{94d}री", None), 4);
+    }
 
     #[test]
     fn teeny_string() {
