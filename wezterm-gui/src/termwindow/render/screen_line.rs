@@ -1,3 +1,4 @@
+use crate::shapecache::ShapedInfo;
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::render::{
     resolve_fg_color_attr, same_hyperlink, update_next_frame_time, ClusterStyleCache,
@@ -475,8 +476,65 @@ impl crate::TermWindow {
                 };
             }
 
-            for info in glyph_info.iter() {
+            let group_layout = if params.use_pixel_positioning {
+                vec![None; glyph_info.len()]
+            } else {
+                layout_zero_cell_groups(glyph_info, cell_width, width_scale)
+            };
+            let mut group_origin_x = cluster_x_pos;
+
+            for (glyph_idx_in_cluster, info) in glyph_info.iter().enumerate() {
                 let glyph = &info.glyph;
+
+                // Glyphs that share a grapheme with trailing zero-cell glyphs
+                // (eg: Devanagari consonant + vowel sign) are positioned
+                // using their natural pen advances relative to the start of
+                // the group, squeezed to fit the cells allotted to the group,
+                // rather than being piled up on the following cell.
+                let (glyph_base_x, glyph_xscale) = match group_layout[glyph_idx_in_cluster] {
+                    Some(p) => {
+                        if p.is_first {
+                            group_origin_x = cluster_x_pos;
+                        }
+                        (group_origin_x + p.dx, p.scale)
+                    }
+                    None => (cluster_x_pos, 1.),
+                };
+
+                // Fill the space around a narrow Indic syllable with the
+                // headline that joins the letters of a word, so that the
+                // word remains connected without distorting the letters.
+                if let Some(GroupPlacement {
+                    is_first: true,
+                    bar: Some(bar),
+                    ..
+                }) = group_layout[glyph_idx_in_cluster]
+                {
+                    let top = cell_height
+                        + (params.render_metrics.descender.get() as f32 + valign_adjust
+                            - bar.bearing_y)
+                            * height_scale;
+                    // The headline of the font is a soft antialiased line that
+                    // sits a little below the top of the glyph bitmap
+                    let top = top + height_scale;
+                    let thickness = height_scale;
+                    for (x0, x1) in [bar.left, bar.right] {
+                        if x1 <= x0 {
+                            continue;
+                        }
+                        let mut quad = layers.allocate(1).context("layers.allocate(1)")?;
+                        quad.set_position(
+                            gl_x + params.left_pixel_x + group_origin_x + x0,
+                            pos_y + top,
+                            gl_x + params.left_pixel_x + group_origin_x + x1,
+                            pos_y + top + thickness,
+                        );
+                        quad.set_texture(gl_state.util_sprites.filled_box.texture_coords());
+                        quad.set_fg_color(item.fg_color.mul_alpha(0.8));
+                        quad.set_has_color(false);
+                        quad.set_hsv(hsv);
+                    }
+                }
 
                 if params.use_pixel_positioning
                     && params.left_pixel_x + cluster_x_pos + glyph.x_advance.get() as f32
@@ -530,7 +588,7 @@ impl crate::TermWindow {
                     if let Some(texture) = texture {
                         // TODO: clipping, but we can do that based on pixels
 
-                        let pos_x = cluster_x_pos
+                        let pos_x = glyph_base_x
                             + if params.use_pixel_positioning {
                                 (glyph.x_offset + glyph.bearing_x).get() as f32
                             } else {
@@ -599,7 +657,9 @@ impl crate::TermWindow {
                             (left, i, right)
                         }
 
-                        let adjust = (glyph.x_offset + glyph.bearing_x).get() as f32;
+                        let width_scale = width_scale * glyph_xscale;
+                        let adjust =
+                            (glyph.x_offset + glyph.bearing_x).get() as f32 * glyph_xscale;
                         let texture_range = pos_x + adjust
                             ..pos_x + adjust + (texture.coords.size.width as f32 * width_scale);
 
@@ -928,4 +988,116 @@ impl crate::TermWindow {
 
         Ok((shaped, invalidate_on_hover_change))
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GroupBar {
+    /// Extent of the headline segment on the left of the glyphs, relative
+    /// to the group origin
+    left: (f32, f32),
+    /// Extent of the headline segment on the right of the glyphs
+    right: (f32, f32),
+    /// Distance above the baseline of the top of the base glyph
+    bearing_y: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GroupPlacement {
+    /// True for the first glyph of the group
+    is_first: bool,
+    /// Horizontal offset of this glyph's pen position from the group origin
+    dx: f32,
+    /// Horizontal scale to apply to offsets and glyph bitmaps
+    scale: f32,
+    /// Headline fill, present on the first glyph of a group only
+    bar: Option<GroupBar>,
+}
+
+/// Horizontal condensing applied to all Indic glyphs relative to the
+/// widest typical letter. Devanagari consonants are about 1.3 times as wide
+/// as their height above the baseline, and a terminal cell is much narrower
+/// than that, so the script is condensed uniformly: this keeps every letter
+/// looking alike rather than squeezing each syllable by a different amount.
+fn indic_condense(cell_width: f32, bearing_y: f32) -> f32 {
+    if bearing_y <= 0. {
+        return 1.;
+    }
+    ((cell_width * 1.2) / (1.31 * bearing_y)).clamp(0.6, 1.0)
+}
+
+/// Identify runs of glyphs that were produced from the same grapheme where
+/// at least one of the glyphs is a zero-cell glyph (typically a spacing
+/// vowel sign following a consonant in Indic scripts), and Indic syllables.
+/// The glyphs of such a run are laid out by their natural advances.
+/// Non-Indic runs are squeezed to fit the cells that the grapheme occupies.
+/// Indic runs are uniformly condensed, centered in their cells, and the
+/// remaining space is filled with the headline that joins the letters.
+fn layout_zero_cell_groups(
+    infos: &[ShapedInfo],
+    cell_width: f32,
+    width_scale: f32,
+) -> Vec<Option<GroupPlacement>> {
+    let mut result = vec![None; infos.len()];
+    let mut start = 0;
+    while start < infos.len() {
+        let cluster = infos[start].cluster;
+        let mut end = start + 1;
+        while end < infos.len() && infos[end].cluster == cluster {
+            end += 1;
+        }
+        let group = &infos[start..end];
+        let has_zero_cell = group.iter().any(|i| i.pos.num_cells == 0);
+        let base = group.iter().find(|i| i.pos.num_cells > 0);
+        let indic = group.iter().all(|i| i.indic);
+        if let Some(base) = base {
+            if (group.len() > 1 && has_zero_cell) || indic {
+                let cells: u32 = group.iter().map(|i| i.pos.num_cells as u32).sum();
+                let allotted = cells as f32 * cell_width;
+                let natural: f32 = group
+                    .iter()
+                    .map(|i| i.glyph.x_advance.get() as f32 * width_scale)
+                    .sum();
+                let bearing_y = (base.glyph.y_offset + base.glyph.bearing_y).get() as f32;
+
+                let mut scale = if indic {
+                    indic_condense(cell_width, bearing_y)
+                } else {
+                    1.
+                };
+                let limit = if indic { allotted * 1.25 } else { allotted * 1.02 };
+                if natural > 0. && natural * scale > limit {
+                    scale = limit / natural;
+                }
+                let content = natural * scale;
+                let offset = if indic && content < allotted {
+                    (allotted - content) / 2.
+                } else {
+                    0.
+                };
+
+                let bar = if indic && group[0].headline && content < allotted - 0.5 {
+                    Some(GroupBar {
+                        left: (0., offset + 0.5),
+                        right: (offset + content - 0.5, allotted),
+                        bearing_y,
+                    })
+                } else {
+                    None
+                };
+
+                let mut pen = 0.;
+                for (n, i) in group.iter().enumerate() {
+                    result[start + n] = Some(GroupPlacement {
+                        is_first: n == 0,
+                        dx: offset + pen * scale,
+                        scale,
+                        bar: if n == 0 { bar } else { None },
+                    });
+                    pen += i.glyph.x_advance.get() as f32 * width_scale;
+                }
+            }
+        }
+        start = end;
+    }
+    result
 }
