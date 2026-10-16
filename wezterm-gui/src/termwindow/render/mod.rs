@@ -756,7 +756,24 @@ impl crate::TermWindow {
         infos: &[GlyphInfo],
         font: &Rc<LoadedFont>,
         metrics: &RenderMetrics,
+        text: &str,
     ) -> anyhow::Result<Vec<Rc<CachedGlyph>>> {
+        // Total number of cells occupied by each Indic grapheme.
+        // A glyph that is part of a syllable is allowed to be as wide as
+        // the whole syllable rather than just its own (possibly zero) cells,
+        // otherwise the glyph cache shrinks it in both dimensions and it
+        // ends up looking shorter than its neighbors.
+        let mut syllable_cells: std::collections::HashMap<u32, u8> = Default::default();
+        for info in infos {
+            let indic = text
+                .get(info.cluster as usize..)
+                .and_then(|t| t.chars().next())
+                .map_or(false, crate::shapecache::is_indic_char);
+            if indic {
+                let e = syllable_cells.entry(info.cluster).or_default();
+                *e = e.saturating_add(info.num_cells);
+            }
+        }
         let mut glyphs = Vec::with_capacity(infos.len());
         let mut iter = infos.iter().peekable();
         while let Some(info) = iter.next() {
@@ -791,7 +808,16 @@ impl crate::TermWindow {
                 followed_by_space,
                 font,
                 metrics,
-                info.num_cells,
+                match syllable_cells.get(&info.cluster) {
+                    // The glyph cache uniformly shrinks (both width and
+                    // height) any glyph wider than its cells, which makes
+                    // wide Indic letters look smaller than narrow ones.
+                    // Indic syllables are condensed horizontally by the
+                    // line renderer instead, so tell the glyph cache that
+                    // it has ample room.
+                    Some(cells) => (*cells).max(info.num_cells).saturating_add(2),
+                    None => info.num_cells,
+                },
             )?);
         }
         Ok(glyphs)
@@ -839,8 +865,13 @@ impl crate::TermWindow {
                             &info,
                             &font,
                             metrics,
+                            &cluster.text,
                         )?;
-                        let shaped = Rc::new(ShapedInfo::process(&info, &glyphs));
+                        let shaped = Rc::new(ShapedInfo::process_with_text(
+                            &info,
+                            &glyphs,
+                            &cluster.text,
+                        ));
 
                         self.shape_cache
                             .borrow_mut()

@@ -25,6 +25,14 @@ pub struct ShapedInfo {
     pub glyph: Rc<CachedGlyph>,
     pub pos: GlyphPosition,
     pub block_key: Option<BlockKey>,
+    /// Byte offset of the text cluster that produced this glyph.
+    /// Glyphs from the same grapheme share the same value.
+    pub cluster: u32,
+    /// True if the text that produced this glyph is in an Indic script block
+    pub indic: bool,
+    /// True if the text that produced this glyph is a letter of a script
+    /// that joins letters with a headline (eg: Devanagari)
+    pub headline: bool,
 }
 
 impl ShapedInfo {
@@ -47,10 +55,41 @@ impl ShapedInfo {
                 },
                 glyph: Rc::clone(glyph),
                 block_key: info.only_char.and_then(BlockKey::from_char),
+                cluster: info.cluster,
+                indic: false,
+                headline: false,
             });
         }
         pos
     }
+
+    /// Like `process`, but additionally tags glyphs that were produced from
+    /// Indic script text so that the renderer can lay out whole syllables.
+    pub fn process_with_text(
+        infos: &[GlyphInfo],
+        glyphs: &[Rc<CachedGlyph>],
+        text: &str,
+    ) -> Vec<ShapedInfo> {
+        let mut pos = Self::process(infos, glyphs);
+        for (p, info) in pos.iter_mut().zip(infos.iter()) {
+            let c = text
+                .get(info.cluster as usize..)
+                .and_then(|t| t.chars().next());
+            p.indic = c.map_or(false, is_indic_char);
+            p.headline = c.map_or(false, is_headline_letter);
+        }
+        pos
+    }
+}
+
+/// True for Devanagari letters, which are joined by a headline (shirorekha)
+pub fn is_headline_letter(c: char) -> bool {
+    matches!(c as u32, 0x0904..=0x0939 | 0x0958..=0x095F | 0x0978..=0x097F)
+}
+
+/// True for codepoints in the Devanagari..Sinhala blocks
+pub fn is_indic_char(c: char) -> bool {
+    (0x0900..0x0E00).contains(&(c as u32))
 }
 
 /// We'd like to avoid allocating when resolving from the cache
